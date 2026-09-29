@@ -12,8 +12,13 @@
   以上数值均须为非负有限数,窗口结束不得早于开始;
 - 抵站过早(早于窗口开始)须等待到窗口开始才开始卸货;
 - 卸货必须在窗口结束前完成(完成时刻 ≤ 窗口结束,恰等允许);
-- 最后一站卸毕时刻不得超过方案运输总时长(``summary.transport_hours``,
-  恰等允许)。
+- 最后一站卸毕时刻不得超过 **规划输入的实际运输总时长**(单段取
+  ``transport_hours`` 原值,分段取各段 ``hours`` 原值之和;恰等允许)。
+  核对用实际时长而非方案 ``summary.transport_hours`` 的四位小数展示值,
+  避免恰在实际时限内卸毕的路线被误判无解。
+
+时刻(行车、等待、卸货)一律按 **未舍入时刻连续累计**;选路穷举、可行性
+判定与逐站明细共用同一条时间线,仅在输出响应时按现有四位小数精度展示。
 
 在全部可行站序中取 **最终卸毕时刻最早** 者;并列时取按输入站点序号
 (1 起)组成的站序 **字典序最小** 者。响应给出逐站抵达/开始卸货/等待/
@@ -54,6 +59,20 @@ def _nonneg_number(raw: Any, label: str) -> float:
 def _station_name(raw: Any, idx: int) -> str:
     name = str(raw or "").strip()
     return name or f"站点 {idx + 1}"
+
+
+def _actual_transport_hours(plan_input: dict[str, Any]) -> float:
+    """规划输入的实际运输总时长(未舍入),用于末站卸毕核对。
+
+    单段取 ``transport_hours`` 原值(留空为 0);分段取各段 ``hours`` 原值
+    之和。两者都是 JSON 里的原始浮点,未经四位小数展示舍入——同一原值求和
+    与路线末站卸毕(同样由原始时长累计)在浮点上逐项相等,故恰等必然成立。
+    """
+    raw_segments = plan_input.get("segments") or []
+    if raw_segments:
+        return sum(float(s["hours"]) for s in raw_segments)
+    th_raw = plan_input.get("transport_hours")
+    return 0.0 if th_raw in (None, "") else float(th_raw)
 
 
 def _parse_delivery_input(payload: dict[str, Any]) -> tuple[
@@ -191,18 +210,25 @@ def _parse_delivery_input(payload: dict[str, Any]) -> tuple[
     return stations, travel, assignments, assign_hint
 
 
-def _evaluate_order(
+def _simulate_order(
     order: list[int],
     stations: list[dict[str, Any]],
     travel: list[list[float]],
     total_hours: float,
-) -> float | None:
-    """快速评估给定站序(0 起下标)的末站卸毕时刻;不可行返回 None。
+) -> list[dict[str, Any]] | None:
+    """按给定站序(0 起下标)在未舍入时间线上连续推演逐站时刻。
 
+    选路穷举、可行性判定与逐站明细共用本函数,保证三者对应同一时间线。
     时刻约定:出库时刻为 0。首站从仓库出发(行车时长 from_warehouse),
     之后按有向矩阵 travel[上一站][本站] 行驶。到站早于窗口开始则等待;
-    卸货完成时刻超过该站窗口结束,或末站卸毕超过方案运输总时长,即不可行。
+    行车、等待、卸货均在未舍入时刻上连续累计,中途不做任何取整,
+    仅由调用方在输出时按现有精度展示。
+
+    卸货完成时刻超过该站窗口结束,或末站卸毕超过实际运输总时长,
+    即不可行(恰等允许,容差 EPS);不可行返回 None,可行返回逐站未舍入
+    时刻行(末行 finish 即该站序的最终卸毕时刻)。
     """
+    rows: list[dict[str, Any]] = []
     t = 0.0
     prev: int | None = None
     last = len(order) - 1
@@ -216,45 +242,72 @@ def _evaluate_order(
             return None
         if pos == last and finish > total_hours + EPS:
             return None
-        t = finish
-        prev = idx
-    return t
-
-
-def _build_stops(
-    order: list[int],
-    stations: list[dict[str, Any]],
-    travel: list[list[float]],
-) -> list[dict[str, Any]]:
-    """对已判定可行的站序构建逐站时刻明细(抵达/等待/卸货/卸毕)。"""
-    rows: list[dict[str, Any]] = []
-    t = 0.0
-    prev: int | None = None
-    for pos, idx in enumerate(order):
-        st = stations[idx]
-        drive = st["from_warehouse"] if prev is None else travel[prev][idx]
-        arrival = _r(t + drive)
-        start = max(arrival, st["window_start"])
         rows.append(
             {
                 "seq": pos + 1,
                 "station_idx": idx,
                 "station_no": st["index"],
                 "name": st["name"],
-                "departure_time": _r(t),
-                "drive_hours": _r(drive),
+                "departure_time": t,
+                "drive_hours": drive,
                 "arrival_time": arrival,
-                "window_start": _r(st["window_start"]),
-                "window_end": _r(st["window_end"]),
-                "wait_hours": _r(start - arrival),
-                "unload_start": _r(start),
-                "unload_hours": _r(st["unload_hours"]),
-                "unload_finish": _r(start + st["unload_hours"]),
+                "window_start": st["window_start"],
+                "window_end": st["window_end"],
+                "wait_hours": start - arrival,
+                "unload_start": start,
+                "unload_hours": st["unload_hours"],
+                "unload_finish": finish,
             }
         )
-        t = start + st["unload_hours"]
+        t = finish
         prev = idx
     return rows
+
+
+def _evaluate_order(
+    order: list[int],
+    stations: list[dict[str, Any]],
+    travel: list[list[float]],
+    total_hours: float,
+) -> float | None:
+    """快速评估给定站序的末站卸毕时刻(未舍入);不可行返回 None。"""
+    rows = _simulate_order(order, stations, travel, total_hours)
+    return None if rows is None else rows[-1]["unload_finish"]
+
+
+def _build_stops(
+    order: list[int],
+    stations: list[dict[str, Any]],
+    travel: list[list[float]],
+    total_hours: float | None = None,
+) -> list[dict[str, Any]]:
+    """对已判定可行的站序构建逐站时刻明细。
+
+    时刻仍由 :func:`_simulate_order` 在未舍入时间线上推演(与选路、可行性
+    判定同一时间线),仅在输出字段上按四位小数展示。``total_hours`` 仅用于
+    可行性兜底,正常调用方已确认站序可行;不传时不做末站总时长校验。
+    """
+    limit = float("inf") if total_hours is None else total_hours
+    rows = _simulate_order(order, stations, travel, limit)
+    assert rows is not None, "已判定可行的站序不应在同一时间线上变为不可行"
+    return [
+        {
+            "seq": row["seq"],
+            "station_idx": row["station_idx"],
+            "station_no": row["station_no"],
+            "name": row["name"],
+            "departure_time": _r(row["departure_time"]),
+            "drive_hours": _r(row["drive_hours"]),
+            "arrival_time": _r(row["arrival_time"]),
+            "window_start": _r(row["window_start"]),
+            "window_end": _r(row["window_end"]),
+            "wait_hours": _r(row["wait_hours"]),
+            "unload_start": _r(row["unload_start"]),
+            "unload_hours": _r(row["unload_hours"]),
+            "unload_finish": _r(row["unload_finish"]),
+        }
+        for row in rows
+    ]
 
 
 def schedule_delivery(payload: dict[str, Any]) -> dict[str, Any]:
@@ -368,7 +421,9 @@ def _build_schedule_response(
 ) -> dict[str, Any]:
     """在已核对的排程输入上穷举站序并构建响应(无可行站序时抛 ScheduleError)。"""
     summary = baseline["summary"]
-    total_hours = float(summary["transport_hours"])
+    # 末站核对一律用规划输入的实际运输总时长(单段原值、分段各段原值之和),
+    # 不用 summary.transport_hours 的四位小数展示值
+    total_hours = _actual_transport_hours(plan_input)
 
     station_boxes: dict[int, list[int]] = {i: [] for i in range(len(stations))}
     station_units: dict[int, int] = {i: 0 for i in range(len(stations))}
@@ -406,8 +461,15 @@ def _build_schedule_response(
             "不返回部分路线,请放宽时间窗、调整卸货耗时或行车时长后重试"
         )
 
-    best_rows = _build_stops(list(best_order), stations, travel)
-    final_finish = best_rows[-1]["unload_finish"]
+    # 选路、可行性与逐站明细复用同一未舍入时间线:最优站序再推演一次,
+    # 末站卸毕与余量都取未舍入值,仅在输出字段上按四位小数展示
+    best_raw_rows = _simulate_order(
+        list(best_order), stations, travel, total_hours
+    )
+    assert best_raw_rows is not None
+    best_rows = _build_stops(list(best_order), stations, travel, total_hours)
+    final_finish_raw = best_raw_rows[-1]["unload_finish"]
+    final_finish = _r(final_finish_raw)
 
     stops: list[dict[str, Any]] = []
     for row in best_rows:
@@ -430,9 +492,9 @@ def _build_schedule_response(
     )}
     verdict = (
         f"最优站序 {order_text},共搜索 {evaluated} 种站序、"
-        f"{feasible_count} 种可行;最后一站于第 {_r(final_finish)}h 卸毕"
+        f"{feasible_count} 种可行;最后一站于第 {final_finish}h 卸毕"
         f"(方案运输总时长 {_r(total_hours)}h,余量 "
-        f"{_r(total_hours - final_finish)}h)"
+        f"{_r(total_hours - final_finish_raw)}h)"
     )
     return {
         "input_fingerprint": input_fingerprint(fp_payload),
@@ -444,7 +506,7 @@ def _build_schedule_response(
         "feasible_order_count": feasible_count,
         "optimal_order": order_nos,
         "final_finish": final_finish,
-        "time_margin": _r(total_hours - final_finish),
+        "time_margin": _r(total_hours - final_finish_raw),
         "stops": stops,
         "stations": [
             {

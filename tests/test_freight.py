@@ -299,6 +299,64 @@ class FreightDirectTestCase(unittest.TestCase):
             "不存在可行的站点送达顺序",
         )
 
+    def test_boundary_actual_total_hours_not_display_value(self):
+        # 实际运输时长 0.12344h,四位小数展示值 0.1234;末站恰在 0.12344h
+        # (=窗口结束)卸毕:分摊与排程同样按实际总时长核对,不得误判无解
+        plan = {
+            "transport_hours": 0.12344,
+            "box_capacity": 100,
+            "zones": [{"name": "z", "t_min": 0, "t_max": 8}],
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+                {"name": "B", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        r = allocate_freight(
+            body(
+                [st("S", 0, 0.12344, u=0.12344)],
+                [[0]],
+                [1, 1],
+                [10],
+                plan=plan,
+            )
+        )
+        self.assertEqual(r["optimal_order"], [1])
+        self.assertEqual(r["transport_total_hours"], 0.1234)
+        self.assertEqual(r["final_finish"], 0.1234)
+        # 两批等权重,10 分各 5
+        self.assertEqual(
+            alloc_by_batch(r["legs"][0]), {1: 5, 2: 5}
+        )
+
+    def test_segments_actual_total_hours_summed_from_raw(self):
+        # 分段:实际总时长 0.1+0.02344=0.12344(展示 0.1234),末站恰等须可行
+        total = 0.1 + 0.02344
+        plan = {
+            "segments": [
+                {"name": "干线段", "hours": 0.1,
+                 "zones": [{"name": "z", "t_min": 0, "t_max": 8}]},
+                {"name": "配送段", "hours": 0.02344,
+                 "zones": [{"name": "z", "t_min": 0, "t_max": 8}]},
+            ],
+            "box_capacity": 100,
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        r = allocate_freight(
+            body(
+                [st("S", 0, total, u=total)],
+                [[0]],
+                [1],
+                [0],
+                plan=plan,
+            )
+        )
+        self.assertEqual(r["transport_total_hours"], 0.1234)
+        self.assertEqual(r["final_finish"], 0.1234)
+        self.assertEqual(r["total_fee_cents"], 0)
+
+
     def test_bad_plan_input_rejected(self):
         self._expect_error(
             body(

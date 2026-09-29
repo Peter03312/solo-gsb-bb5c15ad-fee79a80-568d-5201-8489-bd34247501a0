@@ -147,6 +147,141 @@ class DeliveryDirectTestCase(unittest.TestCase):
         self.assertEqual(d["time_margin"], 0.0)
         self.assertEqual(d["stops"][0]["total_units"], 50)
 
+    def test_boundary_actual_total_kept_full_precision_single_segment(self):
+        # 实际运输时长 0.12344h,四位小数展示值为 0.1234(更小);
+        # 末站恰在实际时限 0.12344h 卸毕时仍须可行(不得拿展示值核对)
+        plan = {
+            "transport_hours": 0.12344,
+            "box_capacity": 100,
+            "zones": [{"name": "z", "t_min": 0, "t_max": 8}],
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        d = schedule_delivery(
+            body(
+                [st("S", 0, 0.12344, 0.12344, 0)],
+                [[0]],
+                [1],
+                plan=plan,
+            )
+        )
+        # 展示值仍按四位小数:总时长/卸毕均为 0.1234,余量 0
+        self.assertEqual(d["transport_total_hours"], 0.1234)
+        self.assertEqual(d["final_finish"], 0.1234)
+        self.assertEqual(d["time_margin"], 0.0)
+        self.assertEqual(d["feasible_order_count"], 1)
+
+    def test_boundary_actual_total_kept_full_precision_segments(self):
+        # 分段运输:实际总时长 = 各段原时长之和 0.1 + 0.02344 = 0.12344(展示 0.1234);
+        # 末站恰在实际总时长卸毕时仍须可行
+        total = 0.1 + 0.02344
+        plan = {
+            "segments": [
+                {"name": "干线段", "hours": 0.1,
+                 "zones": [{"name": "z", "t_min": 0, "t_max": 8}]},
+                {"name": "配送段", "hours": 0.02344,
+                 "zones": [{"name": "z", "t_min": 0, "t_max": 8}]},
+            ],
+            "box_capacity": 100,
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        d = schedule_delivery(
+            body(
+                [st("S", 0, total, total, 0)],
+                [[0]],
+                [1],
+                plan=plan,
+            )
+        )
+        self.assertEqual(d["transport_total_hours"], 0.1234)
+        self.assertEqual(d["final_finish"], 0.1234)
+        self.assertEqual(d["time_margin"], 0.0)
+        self.assertEqual(d["feasible_order_count"], 1)
+
+    def test_over_actual_total_rejected_even_when_displayed_equal(self):
+        # 实际时限 0.12344h、末站 0.123449h 卸毕:实际超限(差 5e-8),
+        # 虽然二者四位小数展示值同为 0.1234,仍须按实际时长拒绝
+        plan = {
+            "transport_hours": 0.12344,
+            "box_capacity": 100,
+            "zones": [{"name": "z", "t_min": 0, "t_max": 8}],
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        with self.assertRaises(ScheduleError) as cm:
+            schedule_delivery(
+                body(
+                    [st("S", 0, 0.123449, 0.123449, 0)],
+                    [[0]],
+                    [1],
+                    plan=plan,
+                )
+            )
+        self.assertIn("不存在可行的站点送达顺序", str(cm.exception))
+
+    def test_stop_detail_uses_unrounded_same_timeline_as_selection(self):
+        # 逐站明细在未舍入时间线上连续累计,中途不取整:
+        # 站1 仓库出发 0.000149h 即到即卸(卸 0h),站1→站2 再 0.000149h。
+        # 实际到站2 = 0.000298h,展示为 0.0003h;
+        # 旧逻辑把站1时刻先舍入成 0.0001h 后续算,到站2 仅 0.000249h(展示 0.0002h)
+        plan = {
+            "transport_hours": 1,
+            "box_capacity": 100,
+            "zones": [{"name": "z", "t_min": 0, "t_max": 8}],
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+                {"name": "B", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        d = schedule_delivery(
+            body(
+                [st("S1", 0, 1, 0, 0.000149), st("S2", 0, 1, 0, 1)],
+                [[0, 0.000149], [1, 0]],
+                [1, 2],
+                plan=plan,
+            )
+        )
+        s1, s2 = d["stops"]
+        self.assertEqual(s1["arrival_time"], 0.0001)
+        self.assertEqual(s1["unload_finish"], 0.0001)
+        self.assertEqual(s2["departure_time"], 0.0001)
+        self.assertEqual(s2["arrival_time"], 0.0003)
+        self.assertEqual(s2["unload_finish"], 0.0003)
+        # 最终卸毕与末行明细一致(同一时间线)
+        self.assertEqual(d["final_finish"], s2["unload_finish"])
+
+    def test_wait_accumulated_from_unrounded_arrival(self):
+        # 站1 到 0.000149h(展示 0.0001)即到即卸;站1→站2 再 0.000149h,
+        # 实际到站2 = 0.000298h,窗口 0.0003h 起:实际仅等待 2e-6h(展示 0.0)。
+        # 旧逻辑沿站1取整后时刻 0.0001h 续算,到站 0.000249h(展示 0.0002),
+        # 等待被算成 0.000051h(展示 0.0001)——等待与到达均偏离选路时间线
+        plan = {
+            "transport_hours": 1,
+            "box_capacity": 100,
+            "zones": [{"name": "z", "t_min": 0, "t_max": 8}],
+            "cargoes": [
+                {"name": "A", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+                {"name": "B", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+            ],
+        }
+        d = schedule_delivery(
+            body(
+                [st("S1", 0, 1, 0, 0.000149), st("S2", 0.0003, 1, 0, 1)],
+                [[0, 0.000149], [1, 0]],
+                [1, 2],
+                plan=plan,
+            )
+        )
+        s2 = d["stops"][1]
+        self.assertEqual(s2["arrival_time"], 0.0003)
+        self.assertEqual(s2["wait_hours"], 0.0)
+        self.assertEqual(s2["unload_start"], 0.0003)
+
+
     def test_infeasible_window_too_short(self):
         with self.assertRaises(ScheduleError) as cm:
             schedule_delivery(

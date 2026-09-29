@@ -210,8 +210,10 @@ APP_PORT=9000 docker compose up -d --build
      **「🚚 搜索最优站序」**;
    - 系统按规划输入快照 **重新规划核对箱号/批次/件数**(不信任客户端明细),
      **穷举全部站序**:抵站早于窗口开始须等待,卸货须在窗口结束前完成,
-     最后一站卸毕不得超过 **方案运输总时长**;取 **最终卸毕时刻最早**、
-     并列时按输入站序号组成的站序 **字典序最小** 者;
+     最后一站卸毕不得超过 **规划输入的实际运输总时长**(单段取原运输时长、
+     分段取各段原时长之和,不使用页面上四位小数的展示值;恰等允许);
+     行车/等待/卸货时刻连续累计、中途不取整,选路与逐站明细为同一时间线;
+     取 **最终卸毕时刻最早**、并列时按输入站序号组成的站序 **字典序最小** 者;
    - 结果逐站给出 **出发/行车/抵达/等待/开始卸货/卸毕时刻** 与该站对应的
      **箱号、批次、件数** 明细;不存在可行站序时明确报错(400),
      **不返回部分路线**;
@@ -504,8 +506,16 @@ curl -X POST http://localhost:8000/api/transport-delay \
 - **时刻推演**(出库为 0):首站行驶 `from_warehouse`,其后行驶
   `travel[上一站][下一站]`;**抵站时刻早于窗口开始则等待**至窗口开始;
   卸货完成时刻 = 开始卸货 + 卸货耗时,**必须 ≤ 该站窗口结束**(恰等允许);
-  **最后一站卸毕时刻必须 ≤ 方案运输总时长**
-  (`summary.transport_hours`,恰等允许);
+  **最后一站卸毕时刻必须 ≤ 规划输入的实际运输总时长**(恰等允许):
+  - **单段**运输取 `plan_input.transport_hours` 的 **原值**;
+  - **分段**运输取各段 `hours` 的 **原值之和**;
+  - 核对使用未舍入的实际时长,**不使用**方案 `summary.transport_hours`
+    的四位小数展示值——因此末站恰在实际时限内卸毕的路线不会因展示值
+    被四舍五入变小而误判无解;反过来,实际超出(即使四位小数展示值相同)
+    仍按实际时长拒绝;
+  - 行车、等待、卸货的时刻全程 **按未舍入时刻连续累计**,选路穷举、
+    可行性判定与逐站明细 **共用同一条时间线**,仅在输出响应时按现有
+    四位小数精度展示(逐站明细不会因中途取整偏离选路时刻);
 - **最优化**:穷举全部 n! 种站序,在可行站序中取 **最终卸毕时刻最早** 者;
   最终卸毕时刻相同(1e-9 容差内)时取按 **输入站点序号**(1 起)组成的
   站序 **字典序最小** 者;响应给出搜索站序总数与可行站序数;
@@ -583,11 +593,73 @@ curl -X POST http://localhost:8000/api/delivery-schedule \
 {"detail": "不存在可行的站点送达顺序:已穷举 2 种站序,均无法同时满足各站签收时间窗(抵站过早须等待、卸货须在窗口结束前完成)且最后一站卸毕不晚于方案运输总时长 3.0h,不返回部分路线,请放宽时间窗、调整卸货耗时或行车时长后重试"}
 ```
 
+**边界输入示例:恰在实际时限内卸毕(超过四位小数)**
+
+实际运输总时长 `0.12344h`,其四位小数展示值为 `0.1234h`(更小);唯一站
+`from_warehouse=0`、窗口 `[0, 0.12344]`、卸货 `0.12344h`,末站恰在
+`0.12344h` 卸毕——恰等窗口结束、恰等实际运输总时长,判为可行;响应里的
+`transport_total_hours`、`final_finish` 仍按四位小数展示为 `0.1234`,
+`time_margin` 为 `0.0`:
+
+```bash
+curl -X POST http://localhost:8000/api/delivery-schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_input": {
+      "transport_hours": 0.12344, "box_capacity": 10,
+      "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}],
+      "cargoes": [
+        {"name": "鲜奶", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8}
+      ]
+    },
+    "stations": [
+      {"name": "边界站", "window_start": 0, "window_end": 0.12344,
+       "unload_hours": 0.12344, "from_warehouse": 0}
+    ],
+    "travel": [[0]],
+    "assignments": [1]
+  }'
+# → 200:{"transport_total_hours": 0.1234, "final_finish": 0.1234,
+#        "time_margin": 0.0, "optimal_order": [1], "feasible_order_count": 1, ...}
+# 若实际时限仍是 0.12344h 而卸毕为 0.123449h(展示同为 0.1234),
+# 则因实际超限返回 400,不返回部分路线。
+```
+
+**边界输入示例:分段总时长按各段原值之和核对**
+
+两段 `0.1h + 0.02344h = 0.12344h`(展示 `0.1234h`),末站恰等实际总时长
+时同样可行(`plan_input` 中无需再给 `transport_hours`):
+
+```bash
+curl -X POST http://localhost:8000/api/delivery-schedule \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_input": {
+      "segments": [
+        {"name": "干线段", "hours": 0.1,
+         "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+        {"name": "配送段", "hours": 0.02344,
+         "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]}
+      ],
+      "box_capacity": 10,
+      "cargoes": [
+        {"name": "鲜奶", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8}
+      ]
+    },
+    "stations": [
+      {"name": "边界站", "window_start": 0, "window_end": 0.12344,
+       "unload_hours": 0.12344, "from_warehouse": 0}
+    ],
+    "travel": [[0]],
+    "assignments": [1]
+  }'
+```
+
 ### 送达站点排程响应字段
 
 | 字段 | 说明 |
 | --- | --- |
-| `transport_total_hours` | 方案运输总时长(末站卸毕不得超过它,恰等允许) |
+| `transport_total_hours` | 方案运输总时长的四位小数展示值(可行性核对用规划输入的实际时长:单段原值、分段各段原值之和;末站卸毕不得超过实际时长,恰等允许) |
 | `station_count` / `orders_evaluated` / `feasible_order_count` | 站点数、穷举站序总数与其中可行的数量 |
 | `optimal_order` | 最优站序(输入站点序号 1 起的列表):最终卸毕最早,并列时字典序最小 |
 | `final_finish` / `time_margin` | 最后一站卸毕时刻 / 距运输总时长的余量 |
@@ -602,8 +674,10 @@ curl -X POST http://localhost:8000/api/delivery-schedule \
   上一站→下一站相邻两站各一程;**条数必须与站数(程数)严格相等**;
 - 服务端沿用规划输入快照及 **站点归属、时间窗与站序规则重新核对可行路线**
   (与 `/api/delivery-schedule` 完全一致的快照重规划、箱号/批次/件数核对与
-  站序穷举);**排程无解、费用条数与站序不符或费用非法时整笔拒绝(400),
-  不返回任何部分分摊**;
+  站序穷举;末站按 **规划输入的实际运输总时长** 核对:单段取
+  `transport_hours` 原值、分段取各段 `hours` 原值之和,不使用四位小数
+  展示值;选路、可行性与逐站时刻为同一未舍入时间线);**排程无解、费用条数
+  与站序不符或费用非法时整笔拒绝(400),不返回任何部分分摊**;
 - **在车批次**:每程只让 **尚未在前站卸下** 的批次分担费用——批次在其归属站
   及之前各程在车,该站卸毕后不再参与后续各程;同批拆多箱时件数按重新规划
   结果合并;
@@ -709,6 +783,36 @@ curl -X POST http://localhost:8000/api/freight-allocation \
 ```json
 {"detail": "分运费共 1 条,但当前排程共 2 程(站点数);费用条数须与站序严格一致(仓库→首站及相邻两站各一程),已拒绝,不返回部分分摊"}
 {"detail": "第 2 程分运费须为非负整数(单位:分),实际为 1.5,不接受小数、负数或非数值,已拒绝,不返回部分分摊"}
+```
+
+**边界输入示例:恰等实际运输总时长的分摊**
+
+实际总时长 `0.12344h`(展示 `0.1234h`),两批同归唯一站、窗口
+`[0, 0.12344]`、卸货 `0.12344h`,末站恰等实际时限,分摊正常返回:
+
+```bash
+curl -X POST http://localhost:8000/api/freight-allocation \
+  -H "Content-Type: application/json" \
+  -d '{
+    "plan_input": {
+      "transport_hours": 0.12344, "box_capacity": 10,
+      "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}],
+      "cargoes": [
+        {"name": "鲜奶", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8},
+        {"name": "三文鱼", "units": 1, "unit_volume": 1, "t_min": 0, "t_max": 8}
+      ]
+    },
+    "stations": [
+      {"name": "边界站", "window_start": 0, "window_end": 0.12344,
+       "unload_hours": 0.12344, "from_warehouse": 0}
+    ],
+    "travel": [[0]],
+    "assignments": [1, 1],
+    "fees": [10]
+  }'
+# → 200:{"transport_total_hours": 0.1234, "final_finish": 0.1234,
+#        "optimal_order": [1], "total_fee_cents": 10,
+#        两批等权重各分摊 5 分;确实无可行站序时仍返回 400,不含部分分摊}
 ```
 
 #### 分运费分摊响应字段
