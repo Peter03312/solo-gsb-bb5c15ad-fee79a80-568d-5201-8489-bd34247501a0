@@ -172,6 +172,110 @@ class DeliveryDirectTestCase(unittest.TestCase):
         self.assertIn("不存在可行的站点送达顺序", str(cm.exception))
         self.assertIn("3.0h", str(cm.exception))
 
+    def test_actual_total_hours_used_not_display_value_solo(self):
+        # 实际运输总时长 2.00004h,四位小数展示值仅 2.0h;末站恰在实际
+        # 时限 2.00004h 卸毕(行驶 2.00003h + 卸货 0.00001h),不得误判无解
+        actual = 2.00004
+        self.assertEqual(round(actual, 4), 2.0)
+        d = schedule_delivery(
+            body(
+                [st("边界站", 0, 10, 0.00001, actual - 0.00001)],
+                [[0]],
+                [1, 1],
+                plan={**PLAN, "transport_hours": actual},
+            )
+        )
+        # 时限核对按未舍入实际值放行;输出仍按现有精度展示
+        self.assertEqual(d["transport_total_hours"], 2.0)
+        self.assertEqual(d["final_finish"], 2.0)
+        self.assertEqual(d["time_margin"], 0.0)
+
+    def test_beyond_actual_hours_but_within_display_value_rejected(self):
+        # 实际总时长 2.00006h(展示 2.0001h);卸毕 2.0001h 虽在展示值内,
+        # 但严格超过实际时限,仍须拒绝
+        actual = 2.00006
+        self.assertEqual(round(actual, 4), 2.0001)
+        with self.assertRaises(ScheduleError) as cm:
+            schedule_delivery(
+                body(
+                    [st("越界站", 0, 10, 2.0001, 0)],
+                    [[0]],
+                    [1, 1],
+                    plan={**PLAN, "transport_hours": actual},
+                )
+            )
+        self.assertIn("不存在可行的站点送达顺序", str(cm.exception))
+        self.assertIn("2.0001h", str(cm.exception))
+
+    def test_segmented_plan_limit_is_sum_of_raw_segment_hours(self):
+        # 分段模式:实际时限取各段原 hours 之和 1.00002+1.00003=2.00005h
+        # (展示 2.0h),未提供 transport_hours 同样成立;末站恰等放行
+        seg_plan = {
+            "box_capacity": 100,
+            "segments": [
+                {"name": "干线段", "hours": 1.00002,
+                 "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+                {"name": "城配段", "hours": 1.00003,
+                 "zones": [{"name": "冷藏区", "t_min": 0, "t_max": 8}]},
+            ],
+            "cargoes": [
+                {"name": "鲜奶", "units": 1, "unit_volume": 1,
+                 "t_min": 2, "t_max": 6},
+            ],
+        }
+        actual_sum = 1.00002 + 1.00003
+        self.assertEqual(round(actual_sum, 4), 2.0)
+        d = schedule_delivery(
+            body(
+                [st("分段站", 0, 10, 0, actual_sum)],
+                [[0]],
+                [1],
+                plan=seg_plan,
+            )
+        )
+        self.assertEqual(d["final_finish"], 2.0)
+        self.assertEqual(d["time_margin"], 0.0)
+
+    def test_stop_detail_wait_uses_unrounded_arrival(self):
+        # 实际抵达 0.123451h 早于窗口 0.1235h,选路时间线上确实等待
+        # 0.000049h(展示 0.0000h);抵达的四位小数展示值虽恰为 0.1235,
+        # 逐站明细仍必须按未舍入时间线在 0.1235h 开窗后才开始卸货
+        arrival_raw = 0.123451
+        self.assertEqual(round(arrival_raw, 4), 0.1235)
+        self.assertEqual(round(0.1235 - arrival_raw, 4), 0.0000)
+        d = schedule_delivery(
+            body(
+                [st("边界窗站", 0.1235, 10, 0.1, arrival_raw)],
+                [[0]],
+                [1, 1],
+                plan={**PLAN, "transport_hours": 10},
+            )
+        )
+        s0 = d["stops"][0]
+        self.assertEqual(s0["arrival_time"], 0.1235)
+        self.assertEqual(s0["wait_hours"], 0.0)
+        self.assertEqual(s0["unload_start"], 0.1235)
+        self.assertEqual(s0["unload_finish"], 0.2235)
+
+    def test_stop_detail_accumulates_without_intermediate_rounding(self):
+        # 两站均开窗即卸、卸货 0:站2 的抵达必须按未舍入时刻
+        # 0.12345+0.23456=0.35801h 连续累计,展示 0.358h;若中途把站1
+        # 卸毕/站2 出发舍成 0.1235h 再累计会得到 0.3581h(偏离选路时间线)
+        d = schedule_delivery(
+            body(
+                [st("A", 0, 20, 0, 0.12345), st("B", 0, 20, 0, 9)],
+                [[0, 0.23456], [9, 0]],
+                [1, 2],
+                plan={**PLAN, "transport_hours": 10},
+            )
+        )
+        s1, s2 = d["stops"]
+        self.assertEqual(s1["arrival_time"], 0.1235)
+        self.assertEqual(s2["departure_time"], 0.1235)
+        self.assertEqual(s2["arrival_time"], round(0.12345 + 0.23456, 4))
+        self.assertEqual(s2["arrival_time"], 0.358)
+        self.assertEqual(s2["wait_hours"], 0.0)
+
     def test_multi_box_station_aggregation(self):
         d = schedule_delivery(
             body(

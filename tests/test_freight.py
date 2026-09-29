@@ -299,6 +299,42 @@ class FreightDirectTestCase(unittest.TestCase):
             "不存在可行的站点送达顺序",
         )
 
+    def test_actual_total_hours_used_not_display_value(self):
+        # 与送达排程同一核对口径:实际总时长 2.00004h(展示 2.0h),末站
+        # 恰在实际时限卸毕不得被判无解;分摊照常返回,无部分结果问题
+        actual = 2.00004
+        self.assertEqual(round(actual, 4), 2.0)
+        r = allocate_freight(
+            body(
+                [st("边界站", 0, 10, u=0.00001, w=actual - 0.00001)],
+                [[0]],
+                [1, 1],
+                [500],
+                plan={**PLAN, "transport_hours": actual},
+            )
+        )
+        self.assertEqual(r["transport_total_hours"], 2.0)
+        self.assertEqual(r["final_finish"], 2.0)
+        self.assertEqual(r["optimal_order"], [1])
+        self.assertEqual(r["total_fee_cents"], 500)
+        self.assertEqual(r["legs"][0]["allocated_total_cents"], 500)
+
+    def test_beyond_actual_hours_rejected_in_allocation(self):
+        # 卸毕 2.0001h 在展示值 2.0001h 上恰等,但实际时限仅 2.00006h,
+        # 分摊整笔拒绝,不返回任何 legs
+        actual = 2.00006
+        self.assertEqual(round(actual, 4), 2.0001)
+        self._expect_error(
+            body(
+                [st("越界站", 0, 10, u=2.0001, w=0)],
+                [[0]],
+                [1, 1],
+                [500],
+                plan={**PLAN, "transport_hours": actual},
+            ),
+            "不存在可行的站点送达顺序",
+        )
+
     def test_bad_plan_input_rejected(self):
         self._expect_error(
             body(
